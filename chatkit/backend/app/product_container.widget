@@ -1,0 +1,49 @@
+{
+  "version": "1.0",
+  "name": "Product image link",
+  "template": "{\"type\":\"Card\",\"size\":\"sm\",\"children\":[{\"type\":\"Col\",\"gap\":3,\"children\":[{\"type\":\"Image\",\"src\":{{ (imageUrl) | tojson }},\"alt\":{{ (alt) | tojson }},\"aspectRatio\":{{ ((4 / 3)) | tojson }},\"frame\":true,\"radius\":\"md\"},{\"type\":\"Button\",\"label\":{{ (buttonLabel) | tojson }},\"iconEnd\":\"external-link\",\"onClickAction\":{\"type\":\"open.url\",\"handler\":\"client\",\"payload\":{\"url\":{{ (productUrl) | tojson }}}}}]}]}",
+  "jsonSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "productUrl": { "type": "string" },
+      "imageUrl": { "type": "string" },
+      "alt": { "type": "string" },
+      "buttonLabel": { "type": "string" }
+    },
+    "required": ["productUrl", "imageUrl", "alt", "buttonLabel"],
+    "additionalProperties": false
+  },
+  "outputJsonPreview": {
+    "type": "Card",
+    "size": "sm",
+    "children": [
+      {
+        "type": "Col",
+        "gap": 3,
+        "children": [
+          {
+            "type": "Image",
+            "src": "https://upload.wikimedia.org/wikipedia/commons/f/f5/No-Image-Placeholder-landscape.svg",
+            "alt": "Product image placeholder",
+            "aspectRatio": 1.3333333333333333,
+            "frame": true,
+            "radius": "md"
+          },
+          {
+            "type": "Button",
+            "label": "Open product",
+            "iconEnd": "external-link",
+            "onClickAction": {
+              "type": "open.url",
+              "handler": "client",
+              "payload": {
+                "url": "https://your-site.com/products/example"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
