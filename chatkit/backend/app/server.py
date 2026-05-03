@@ -1,12 +1,12 @@
 
 
-
 """
 Enhanced Vitreon ChatKit server with unified agent + semantic retrieval
 """
 
 import json
 import os
+import re
 import numpy as np
 from dotenv import load_dotenv
 from agents import Runner, Agent
@@ -16,9 +16,9 @@ import openai
 
 from .memory_store import MemoryStore
 from .product_tools import show_product_card
-from .support_knowledge import SUPPORT_KNOWLEDGE
-from .general_knowledge import GENERAL_KNOWLEDGE
-from .product_tools import PRODUCT_KNOWLEDGE
+
+from . import kb_index
+
 # --------------------------------------------------
 # Load environment variables
 # --------------------------------------------------
@@ -34,12 +34,12 @@ openai.api_key = OPENAI_API_KEY
 # --------------------------------------------------
 MAX_RECENT_ITEMS = 30
 MODEL = "gpt-4.1-mini"
+MAX_PRODUCTS = 5  # Maximum products to show at once
 
 # --------------------------------------------------
 # Embedding helpers
 # --------------------------------------------------
 def embed_text(text) -> np.ndarray:
-    """Generate embeddings for a text string using OpenAI."""
     if not isinstance(text, str) or not text.strip():
         text = " "
     response = openai.embeddings.create(
@@ -50,118 +50,71 @@ def embed_text(text) -> np.ndarray:
 
 
 def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
-    return float(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2)))
+    denom = (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(vec1, vec2) / denom)
 
 
-def precompute_embeddings(kb):
-    for entry in kb:
-        if entry.get("embedding") is None:
-            entry["embedding"] = embed_text(entry["text"])
-    return kb
-
-
-# Precompute embeddings for semantic search
-GENERAL_KNOWLEDGE = precompute_embeddings(GENERAL_KNOWLEDGE)
-SUPPORT_KNOWLEDGE = precompute_embeddings(SUPPORT_KNOWLEDGE)
 
 # --------------------------------------------------
-# Multi-intent classifier
+# Multi-intent + Shopping State Classifier
 # --------------------------------------------------
 multi_intent_classifier = Agent(
     model=MODEL,
-    name="Multi-Intent Classifier",
+    name="Shopping State Classifier",
     instructions=(
-        "Analyze the user's LATEST message and determine which information categories are needed.\n"
-        "Return a JSON object with boolean flags.\n\n"
-        "DEFINITIONS:\n"
-        "- needs_support: Specific policy questions (Refunds, Privacy, Terms, Data Security, Contacting Support, Trade, work with us, values, sustainability).\n"
-        "- needs_general: Company info (Founding date, Mission), Services, Features, Benefits, 'What do you do?'.\n"
-        "- needs_products: Requests to see products, shopping, recommendations, pricing for specific items.\n\n"
-        "JSON FORMAT:\n"
-        "{\n"
-        '  "needs_support": true/false,\n'
-        '  "needs_general": true/false,\n'
-        '  "needs_products": true/false\n'
-        "}\n"
+        """
+Return ONLY valid JSON. No commentary. No markdown.
+
+Analyze the conversation and decide:
+
+{
+  "shopping_active": true | false,
+  "needs_support": true | false,
+  "needs_general": true | false
+}
+
+Rules:
+- shopping_active = true if the user is browsing, asking about, comparing,
+  filtering, or requesting products.
+- shopping_active remains true across follow-ups unless the user clearly changes topic.
+- If unsure, set shopping_active to true.
+"""
     ),
 )
 
-# Precompute embeddings for product knowledge at server startup
-for product_id, product in PRODUCT_KNOWLEDGE.items():
+# --------------------------------------------------
+# Precompute embeddings for product knowledge
+# --------------------------------------------------
+for product_id, product in kb_index.PRODUCT_KNOWLEDGE.items():
     if "embedding" not in product or product["embedding"] is None:
-        # Combine title, description, and labels for embedding
         text_to_embed = f"{product['title']} {product['description']} {' '.join(product.get('labels', []))}"
         product["embedding"] = embed_text(text_to_embed)
 
 # --------------------------------------------------
-# Semantic retrieval
+# Semantic retrieval helpers
 # --------------------------------------------------
 def retrieve_relevant_kb(query: str, kb_entries, top_k=5, min_similarity=0.0):
-    """Return top-k relevant text blocks, optionally filtering by similarity."""
     query_vec = embed_text(query)
     similarities = [cosine_similarity(query_vec, entry["embedding"]) for entry in kb_entries]
     top_indices = np.argsort(similarities)[::-1][:top_k]
     return [kb_entries[i]["text"] for i in top_indices if similarities[i] >= min_similarity]
 
-# --------------------------------------------------
-# Unified agent template
-# --------------------------------------------------
-UNIFIED_AGENT_TEMPLATE = """
 
-    You are a customer support assistant for Inspitalfields,
-    an independent sustainable gift shop.
+def find_matching_products_semantic(query: str, top_k=MAX_PRODUCTS):
+    if not query or not query.strip():
+        query = "product"
 
-    ONLY use the information below.
-    If it is not present, say:
-    "I’m sorry, I don’t have that information at the moment."
-
-    Context:
-    {context}
-
-    Customer question:
-    {question}
-
-    Answer clearly, warmly, and concisely:
-"""
-
-
-
-
-def find_matching_products_semantic(query: str, top_k=5):
-    """Return top-k products that best match the query using embeddings."""
     query_vec = embed_text(query)
     similarities = []
-    
-    for product_id, product in PRODUCT_KNOWLEDGE.items():
+
+    for product_id, product in kb_index.PRODUCT_KNOWLEDGE.items():
         sim = cosine_similarity(query_vec, product["embedding"])
         similarities.append((sim, product_id, product))
-    
-    # Sort by similarity descending
+
     similarities.sort(reverse=True, key=lambda x: x[0])
-    
-    # Return top matches as (product_id, product dict)
     return [(pid, p) for sim, pid, p in similarities[:top_k]]
-
-
-
-# --------------------------------------------------
-# Product retrieval
-# --------------------------------------------------
-def find_matching_products(keywords_str):
-    keywords = [k.strip().lower() for k in keywords_str.split(",")]
-    if "all" in keywords or "products" in keywords:
-        return list(PRODUCT_KNOWLEDGE.items())
-
-    matches = []
-    for product_id, product in PRODUCT_KNOWLEDGE.items():
-        label_matches = sum(1 for k in keywords if k in [l.lower() for l in product.get("labels", [])])
-        title_matches = sum(1 for k in keywords if k in product.get("title", "").lower())
-        description_matches = sum(1 for k in keywords if k in product.get("description", "").lower())
-        score = (label_matches * 3) + (title_matches * 2) + description_matches
-        if score > 0:
-            matches.append((score, product_id, product))
-    matches.sort(reverse=True, key=lambda x: x[0])
-    return [(pid, p) for _, pid, p in matches]
 
 
 def build_reference_context(blocks, title):
@@ -172,13 +125,23 @@ def build_reference_context(blocks, title):
 
 def build_product_context(products):
     if not products:
-        return "\n\nAvailable Products:\n[No matching products found. Ask the user for more details.]"
+        return "\n\nAvailable Products:\n[No matching products found.]"
+
     context = "\n\nAvailable Products:\n"
     for product_id, p in products:
+        quantity = p.get("quantity", 0)
+        if quantity == 0:
+            stock_status = "OUT OF STOCK"
+        elif quantity <= 5:
+            stock_status = f"LOW STOCK — only {quantity} left"
+        else:
+            stock_status = f"In stock ({quantity} available)"
+
         context += (
             f"- product_id: {product_id}\n"
             f"  title: {p['title']}\n"
             f"  price: {p['price']} {p['currency']}\n"
+            f"  stock: {stock_status}\n"
             f"  description: {p['description']}\n"
             f"  image: {p['image_url']}\n"
             f"  link: {p['product_url']}\n"
@@ -186,6 +149,45 @@ def build_product_context(products):
         )
     return context
 
+
+# --------------------------------------------------
+# Extract requested product count from user message
+# --------------------------------------------------
+def extract_requested_count(text: str) -> int | None:
+    if not text:
+        return None
+    match = re.search(r"\b(\d+)\b", text)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+# --------------------------------------------------
+# Unified agent template
+# --------------------------------------------------
+UNIFIED_AGENT_TEMPLATE = """
+You are a customer support assistant for Inspitalfields,
+an independent sustainable gift shop.
+
+You MUST use the provided product data when shopping is active.
+When mentioning a product to the user, ALWAYS call the tool
+`show_product_card` with the correct product_id so the product card appears.
+
+ONLY use the information below.
+If it is not present, say:
+"I’m sorry, I don’t have that information at the moment."
+
+Context:
+{context}
+
+Customer question:
+{question}
+
+Answer clearly, warmly, and concisely:
+"""
 
 
 # --------------------------------------------------
@@ -195,13 +197,23 @@ class StarterChatServer(ChatKitServer):
     def __init__(self):
         self.store = MemoryStore()
         self.support_label_extractor = Agent(model=MODEL, name="Support Label Extractor", instructions="...")
-        self.product_keyword_extractor = Agent(model=MODEL, name="Product Keyword Extractor", instructions="...")
         super().__init__(self.store)
 
+        # Persistent shopping state
+        self.is_shopping = False
+        self.all_shown_product_ids = set()  # All products ever shown
+        self.shown_this_turn = set()        # Products shown this turn
+
     async def respond(self, thread, item, context):
-        # Convert thread items to agent_input safely
+        # Load recent conversation
         if thread:
-            items_page = await self.store.load_thread_items(thread.id, after=None, limit=MAX_RECENT_ITEMS, order="desc", context=context)
+            items_page = await self.store.load_thread_items(
+                thread.id,
+                after=None,
+                limit=MAX_RECENT_ITEMS,
+                order="desc",
+                context=context
+            )
             items = list(reversed(items_page.data))
             agent_input = await simple_to_agent_input(items)
             if not isinstance(agent_input, list):
@@ -211,7 +223,7 @@ class StarterChatServer(ChatKitServer):
 
         agent_context = AgentContext(thread=thread, store=self.store, request_context=context)
 
-        # Safely get last message
+        # Get last message
         last_message = ""
         if agent_input:
             last_msg_obj = agent_input[-1]
@@ -221,13 +233,29 @@ class StarterChatServer(ChatKitServer):
                 last_message = str(last_msg_obj)
 
         # -----------------------------
-        # 1. Intent Classification
+        # 1. Intent + Shopping State Classification
         # -----------------------------
-        intent_result = await Runner.run(multi_intent_classifier, agent_input, context=agent_context)
+        intent_result = await Runner.run(
+            multi_intent_classifier,
+            agent_input,
+            context=agent_context
+        )
+
         try:
             intent_flags = json.loads(intent_result.final_output.strip())
-        except Exception:
-            intent_flags = {"needs_support": False, "needs_general": True, "needs_products": False}
+        except Exception as e:
+            print("⚠️ Intent parse failed:", intent_result.final_output, e)
+            intent_flags = {
+                "shopping_active": True,
+                "needs_support": False,
+                "needs_general": False,
+            }
+
+        shopping_active = bool(intent_flags.get("shopping_active", False))
+        if shopping_active:
+            self.is_shopping = True
+        elif intent_flags.get("shopping_active") is False:
+            self.is_shopping = False
 
         # -----------------------------
         # 2. Build Dynamic Context
@@ -236,28 +264,73 @@ class StarterChatServer(ChatKitServer):
         tools = []
 
         if intent_flags.get("needs_support"):
-            support_blocks = retrieve_relevant_kb(last_message, SUPPORT_KNOWLEDGE)
+            support_blocks = retrieve_relevant_kb(last_message, kb_index.SUPPORT_KNOWLEDGE)
             dynamic_context += build_reference_context(support_blocks, "CUSTOMER SUPPORT INFORMATION")
 
         if intent_flags.get("needs_general"):
-            general_blocks = retrieve_relevant_kb(last_message, GENERAL_KNOWLEDGE)
+            general_blocks = retrieve_relevant_kb(last_message, kb_index.GENERAL_KNOWLEDGE)
             dynamic_context += build_reference_context(general_blocks, "GENERAL KNOWLEDGE")
 
-        if intent_flags.get("needs_products"):
-            # Extract user query for product
-            keyword_result = await Runner.run(self.product_keyword_extractor, agent_input, context=agent_context)
-            query = str(getattr(keyword_result, "final_output", "")).lower()
-            
-            # Semantic search for products
-            products = find_matching_products_semantic(query)
-            
-            # Build context for agent and add widget tool
-            dynamic_context += build_product_context(products)
+        # -----------------------------
+        # 3. Shopping Flow Product Retrieval
+        # -----------------------------
+        if self.is_shopping:
+            requested_count = extract_requested_count(last_message) or MAX_PRODUCTS
+            query = last_message.lower()
+
+            # 1️⃣ Detect explicit product mentions
+            explicit_match_ids = [
+                pid for pid, product in kb_index.PRODUCT_KNOWLEDGE.items()
+                if product['title'].lower() in query
+            ]
+
+            # 2️⃣ Detect "different" or "other" requests
+            user_wants_different = bool(re.search(r"\b(different|other|another)\b", query))
+
+            # 3️⃣ Gather semantic matches
+            all_products = find_matching_products_semantic(query, top_k=len(kb_index.PRODUCT_KNOWLEDGE))
+
+            # 4️⃣ Select products to show
+            products_to_show = []
+
+            # Add explicit requests first
+            for pid in explicit_match_ids:
+                product = kb_index.PRODUCT_KNOWLEDGE.get(pid)
+                if product:
+                    products_to_show.append((pid, product))
+
+            # Then add new/different products if needed
+            exclude_ids = self.all_shown_product_ids if user_wants_different else set()
+            exclude_ids |= {pid for pid, _ in products_to_show}
+
+            for pid, product in all_products:
+                if pid not in exclude_ids:
+                    products_to_show.append((pid, product))
+                if len(products_to_show) >= MAX_PRODUCTS:
+                    break
+
+            # 5️⃣ Track shown products
+            self.shown_this_turn = {pid for pid, _ in products_to_show}
+            self.all_shown_product_ids.update(self.shown_this_turn)
+
+            # 6️⃣ Inform assistant if requested more than MAX_PRODUCTS
+            if requested_count > MAX_PRODUCTS:
+                dynamic_context += (
+                    f"\n\nNote to assistant:\n"
+                    f"The user requested {requested_count} products, "
+                    f"but you can only show up to {MAX_PRODUCTS} products at a time. "
+                    f"Politely explain this to the user."
+                )
+
+            # 7️⃣ Build context for assistant
+            dynamic_context += build_product_context(products_to_show)
             tools.append(show_product_card)
 
+            # Debug
+            print("🛍️ Shopping active | Products this turn:", [pid for pid, _ in products_to_show])
 
         # -----------------------------
-        # 3. Unified Agent
+        # 4. Unified Agent
         # -----------------------------
         agent_prompt = UNIFIED_AGENT_TEMPLATE.format(
             context=dynamic_context,
@@ -266,15 +339,14 @@ class StarterChatServer(ChatKitServer):
 
         agent = Agent(
             model=MODEL,
-            name="Car Customr Support Assistant",
+            name="Inspitalfields Shopping Assistant",
             instructions=agent_prompt,
             tools=tools
         )
 
         # -----------------------------
-        # 4. Stream Response
+        # 5. Stream Response
         # -----------------------------
         result = Runner.run_streamed(agent, agent_input, context=agent_context)
         async for event in stream_agent_response(agent_context, result):
             yield event
-

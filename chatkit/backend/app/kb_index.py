@@ -1,28 +1,49 @@
-from openai import OpenAI
+
+
+# kb_index.py
+import os
 import numpy as np
-from .support_knowledge import SUPPORT_KNOWLEDGE
-from .general_knowledge import GENERAL_KNOWLEDGE
-from .product_tools import PRODUCT_KNOWLEDGE
+from pymongo import MongoClient
+from dotenv import load_dotenv
 
-client = OpenAI(api_key="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")
+load_dotenv()
 
-def embed_text(text: str):
-    response = client.embeddings.create(
-        model="text-embedding-ada-002",
-        input=text
-    )
-    return np.array(response["data"][0]["embedding"])
+mongo = MongoClient("mongodb+srv://vitreongen_db_user:7I0TIyn3Ja21mFXN@vitreon-dashboard.rnn0q9b.mongodb.net/")
+db = mongo["botbrain"]
 
-# --------------------------------------------------
-# Precompute embeddings for KBs at startup
-# --------------------------------------------------
-for kb in [GENERAL_KNOWLEDGE, SUPPORT_KNOWLEDGE]:
-    for entry in kb:
-        if entry.get("embedding") is None:
-            entry["embedding"] = embed_text(entry["text"])
+def load_knowledge():
+    entries = list(db.knowledge.find({"embedding": {"$exists": True}}))
+    for e in entries:
+        e["embedding"] = np.array(e["embedding"])
+    return entries
 
-# Precompute embeddings for all car products
-for product_id, product in PRODUCT_KNOWLEDGE.items():
-    if product.get("embedding") is None:
-        text_to_embed = f"{product['title']} {product['description']} {' '.join(product.get('labels', []))}"
-        product["embedding"] = embed_text(text_to_embed)
+def load_products():
+    products = list(db.products.find({"embedding": {"$exists": True}}))
+    result = {}
+    for p in products:
+        p["embedding"] = np.array(p["embedding"])
+        result[p["product_id"]] = p
+    return result
+
+KNOWLEDGE_INDEX = load_knowledge()
+PRODUCT_KNOWLEDGE = load_products()
+
+import threading
+import time
+
+def _reload():
+    global PRODUCT_KNOWLEDGE, KNOWLEDGE_INDEX, GENERAL_KNOWLEDGE, SUPPORT_KNOWLEDGE
+    while True:
+        time.sleep(300)
+        PRODUCT_KNOWLEDGE = load_products()
+        KNOWLEDGE_INDEX = load_knowledge()
+        GENERAL_KNOWLEDGE = [e for e in KNOWLEDGE_INDEX if e.get("category") == "general"]
+        SUPPORT_KNOWLEDGE = [e for e in KNOWLEDGE_INDEX if e.get("category") == "support"]
+        print("🔄 Knowledge reloaded from MongoDB")
+
+# Add at the bottom of kb_index.py, after KNOWLEDGE_INDEX is set
+GENERAL_KNOWLEDGE = [e for e in KNOWLEDGE_INDEX if e.get("category") == "general"]
+SUPPORT_KNOWLEDGE = [e for e in KNOWLEDGE_INDEX if e.get("category") == "support"]
+
+# Start background reload thread
+threading.Thread(target=_reload, daemon=True).start()
