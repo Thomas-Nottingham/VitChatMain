@@ -105,6 +105,7 @@ from . import kb_index
 from .db import fetch_products_from_db, product_label_context
  
 from fastapi.staticfiles import StaticFiles
+
  
 load_dotenv()
 print("OPENAI_API_KEY =", os.environ.get("OPENAI_API_KEY"))

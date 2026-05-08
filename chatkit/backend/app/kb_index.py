@@ -34,7 +34,7 @@ import time
 def _reload():
     global PRODUCT_KNOWLEDGE, KNOWLEDGE_INDEX, GENERAL_KNOWLEDGE, SUPPORT_KNOWLEDGE
     while True:
-        time.sleep(300)
+        time.sleep(60)
         PRODUCT_KNOWLEDGE = load_products()
         KNOWLEDGE_INDEX = load_knowledge()
         GENERAL_KNOWLEDGE = [e for e in KNOWLEDGE_INDEX if e.get("category") == "general"]
