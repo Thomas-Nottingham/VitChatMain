@@ -1,385 +1,13 @@
 
-# """
-# Inspitalfields ChatKit server — improved shopping assistant
-# """
-
-# import json
-# import os
-# import re
-# import numpy as np
-# from dotenv import load_dotenv
-# from agents import Runner, Agent
-# from chatkit.agents import AgentContext, simple_to_agent_input, stream_agent_response
-# from chatkit.server import ChatKitServer
-# import openai
-
-# from .memory_store import MemoryStore
-# from .product_tools import show_product_card
-# from . import kb_index
-
-# # --------------------------------------------------
-# # Load environment variables
-# # --------------------------------------------------
-# load_dotenv()
-# OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-# if not OPENAI_API_KEY:
-#     raise ValueError("OPENAI_API_KEY not set in environment")
-
-# openai.api_key = OPENAI_API_KEY
-
-# # --------------------------------------------------
-# # Config
-# # --------------------------------------------------
-# MAX_RECENT_ITEMS = 30
-# MODEL = "gpt-4.1-mini"
-# MAX_PRODUCTS = 5
-
-# # --------------------------------------------------
-# # Embedding helpers
-# # --------------------------------------------------
-# def embed_text(text) -> np.ndarray:
-#     if not isinstance(text, str) or not text.strip():
-#         text = " "
-#     response = openai.embeddings.create(
-#         model="text-embedding-ada-002",
-#         input=text
-#     )
-#     return np.array(response.data[0].embedding)
-
-
-# def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
-#     denom = np.linalg.norm(vec1) * np.linalg.norm(vec2)
-#     if denom == 0:
-#         return 0.0
-#     return float(np.dot(vec1, vec2) / denom)
-
-
-# # --------------------------------------------------
-# # Intent classifier — improved with clearer rules
-# # --------------------------------------------------
-# multi_intent_classifier = Agent(
-#     model=MODEL,
-#     name="Intent Classifier",
-#     instructions="""
-# You are an intent classifier for a shopping assistant chatbot.
-
-# Analyse the FULL conversation history and the latest message, then return ONLY valid JSON — no commentary, no markdown.
-
-# {
-#   "shopping_active": true | false,
-#   "needs_support": true | false,
-#   "needs_general": true | false,
-#   "is_followup": true | false,
-#   "out_of_stock_ok": true | false
-# }
-
-# Rules:
-# - shopping_active = true when the user is browsing, asking about products, requesting recommendations, asking about price, stock, availability, or wanting to buy something. Once true, keep it true unless the user explicitly changes topic entirely.
-# - needs_support = true when asking about returns, refunds, delivery, shipping, complaints, or policies.
-# - needs_general = true when asking about the company, founders, values, sustainability, or what the shop does.
-# - is_followup = true when the latest message refers to a product already discussed (e.g. "how many left", "tell me more", "can I buy it", "yes please", "what about the price").
-# - out_of_stock_ok = true when the user explicitly says they want to see all products regardless of stock, or asks about out-of-stock items specifically.
-
-# Be generous — if in doubt, set shopping_active to true.
-# """
-# )
-
-
-# # --------------------------------------------------
-# # Semantic retrieval
-# # --------------------------------------------------
-# def retrieve_relevant_kb(query: str, kb_entries, top_k=5, min_similarity=0.0):
-#     if not kb_entries:
-#         return []
-#     query_vec = embed_text(query)
-#     similarities = [cosine_similarity(query_vec, entry["embedding"]) for entry in kb_entries]
-#     top_indices = np.argsort(similarities)[::-1][:top_k]
-#     return [kb_entries[i]["text"] for i in top_indices if similarities[i] >= min_similarity]
-
-
-# def find_matching_products_semantic(query: str, top_k=MAX_PRODUCTS, include_out_of_stock=False):
-#     if not query or not query.strip():
-#         query = "product"
-
-#     query_vec = embed_text(query)
-#     similarities = []
-
-#     for product_id, product in kb_index.PRODUCT_KNOWLEDGE.items():
-#         # Skip out of stock unless explicitly requested
-#         if not include_out_of_stock and product.get("quantity", 1) == 0:
-#             continue
-#         sim = cosine_similarity(query_vec, product["embedding"])
-#         similarities.append((sim, product_id, product))
-
-#     similarities.sort(reverse=True, key=lambda x: x[0])
-#     return [(pid, p) for sim, pid, p in similarities[:top_k]]
-
-
-# def build_reference_context(blocks, title):
-#     if not blocks:
-#         return ""
-#     return f"\n\n=== {title} ===\n" + "\n\n---\n\n".join(blocks)
-
-
-# def build_product_context(products):
-#     if not products:
-#         return "\n\nAvailable Products:\n[No matching products found in our current catalogue.]"
-
-#     context = "\n\nAvailable Products (use this data to answer all product questions):\n"
-#     for product_id, p in products:
-#         quantity = p.get("quantity", 0)
-#         if quantity == 0:
-#             stock_status = "❌ OUT OF STOCK — do not recommend for immediate purchase"
-#         elif quantity <= 3:
-#             stock_status = f"🔴 VERY LOW STOCK — only {quantity} left, create urgency"
-#         elif quantity <= 10:
-#             stock_status = f"🟡 LOW STOCK — {quantity} remaining"
-#         else:
-#             stock_status = f"✅ In stock — {quantity} available"
-
-#         context += (
-#             f"\n- product_id: {product_id}\n"
-#             f"  title: {p['title']}\n"
-#             f"  price: £{p['price']} {p.get('currency', 'GBP')}\n"
-#             f"  stock: {stock_status}\n"
-#             f"  description: {p['description']}\n"
-#             f"  labels: {', '.join(p.get('labels', []))}\n"
-#             f"  image: {p.get('image_url', '')}\n"
-#             f"  link: {p.get('product_url', '')}\n"
-#             "  ---"
-#         )
-#     return context
-
-
-# # --------------------------------------------------
-# # Extract requested product count
-# # --------------------------------------------------
-# def extract_requested_count(text: str) -> int | None:
-#     if not text:
-#         return None
-#     match = re.search(r"\b(\d+)\b", text)
-#     if match:
-#         try:
-#             return int(match.group(1))
-#         except ValueError:
-#             return None
-#     return None
-
-
-# # --------------------------------------------------
-# # Agent prompt template — improved
-# # --------------------------------------------------
-# UNIFIED_AGENT_TEMPLATE = """
-# You are a warm, knowledgeable shopping assistant for Inspitalfields — an independent sustainable gift shop in Old Spitalfields Market, East London.
-
-# YOUR PERSONALITY:
-# - Friendly, helpful, and enthusiastic about the products
-# - You genuinely love sustainable and independent brands
-# - You give concise, useful answers — not walls of text
-# - You use natural language, not bullet point lists
-
-# CRITICAL RULES — follow these exactly:
-# 1. ALWAYS call show_product_card for every product you mention by name — without exception
-# 2. ALWAYS tell the customer the stock level when discussing a specific product
-# 3. If a product is OUT OF STOCK, say so clearly but offer alternatives
-# 4. If stock is LOW (3 or fewer), create natural urgency — e.g. "only 2 left so worth grabbing soon"
-# 5. NEVER make up stock numbers — only use the exact figures provided below
-# 6. NEVER recommend a product if it shows OUT OF STOCK unless the customer specifically asks about it
-# 7. If asked about a product not in the data below, say you don't currently carry it and offer the closest alternative
-# 8. When the customer says "yes please", "tell me more", or similar — they are following up on the last product discussed, so provide more detail about it
-
-# PRODUCT DATA (use this as your single source of truth):
-# {context}
-
-# CUSTOMER MESSAGE:
-# {question}
-
-# Respond naturally and helpfully:
-# """
-
-
-# # --------------------------------------------------
-# # Chat Server
-# # --------------------------------------------------
-# class StarterChatServer(ChatKitServer):
-#     def __init__(self):
-#         self.store = MemoryStore()
-#         super().__init__(self.store)
-
-#         # Per-session shopping state
-#         self.is_shopping = False
-#         self.all_shown_product_ids = set()
-#         self.shown_this_turn = set()
-#         self.last_discussed_products = []  # Track last products for follow-ups
-
-#     async def respond(self, thread, item, context):
-#         # Load recent conversation
-#         if thread:
-#             items_page = await self.store.load_thread_items(
-#                 thread.id,
-#                 after=None,
-#                 limit=MAX_RECENT_ITEMS,
-#                 order="desc",
-#                 context=context
-#             )
-#             items = list(reversed(items_page.data))
-#             agent_input = await simple_to_agent_input(items)
-#             if not isinstance(agent_input, list):
-#                 agent_input = []
-#         else:
-#             agent_input = []
-
-#         agent_context = AgentContext(thread=thread, store=self.store, request_context=context)
-
-#         # Get last message
-#         last_message = ""
-#         if agent_input:
-#             last_msg_obj = agent_input[-1]
-#             if isinstance(last_msg_obj, dict) and "content" in last_msg_obj:
-#                 last_message = str(last_msg_obj["content"])
-#             else:
-#                 last_message = str(last_msg_obj)
-
-#         # -----------------------------
-#         # 1. Intent Classification
-#         # -----------------------------
-#         intent_result = await Runner.run(
-#             multi_intent_classifier,
-#             agent_input,
-#             context=agent_context
-#         )
-
-#         try:
-#             intent_flags = json.loads(intent_result.final_output.strip())
-#         except Exception as e:
-#             print("⚠️ Intent parse failed:", intent_result.final_output, e)
-#             intent_flags = {
-#                 "shopping_active": True,
-#                 "needs_support": False,
-#                 "needs_general": False,
-#                 "is_followup": False,
-#                 "out_of_stock_ok": False,
-#             }
-
-#         shopping_active = bool(intent_flags.get("shopping_active", False))
-#         is_followup = bool(intent_flags.get("is_followup", False))
-#         out_of_stock_ok = bool(intent_flags.get("out_of_stock_ok", False))
-
-#         if shopping_active:
-#             self.is_shopping = True
-#         elif intent_flags.get("shopping_active") is False:
-#             self.is_shopping = False
-
-#         # -----------------------------
-#         # 2. Build Dynamic Context
-#         # -----------------------------
-#         dynamic_context = ""
-#         tools = []
-
-#         if intent_flags.get("needs_support"):
-#             support_blocks = retrieve_relevant_kb(last_message, kb_index.SUPPORT_KNOWLEDGE)
-#             dynamic_context += build_reference_context(support_blocks, "CUSTOMER SUPPORT INFORMATION")
-
-#         if intent_flags.get("needs_general"):
-#             general_blocks = retrieve_relevant_kb(last_message, kb_index.GENERAL_KNOWLEDGE)
-#             dynamic_context += build_reference_context(general_blocks, "GENERAL KNOWLEDGE")
-
-#         # -----------------------------
-#         # 3. Shopping Flow
-#         # -----------------------------
-#         if self.is_shopping:
-#             requested_count = extract_requested_count(last_message) or MAX_PRODUCTS
-#             query = last_message.lower()
-
-#             user_wants_different = bool(re.search(r"\b(different|other|another|else|more options)\b", query))
-
-#             products_to_show = []
-
-#             if is_followup and self.last_discussed_products:
-#                 # Follow-up message — re-use the products from last turn
-#                 products_to_show = [
-#                     (pid, kb_index.PRODUCT_KNOWLEDGE[pid])
-#                     for pid in self.last_discussed_products
-#                     if pid in kb_index.PRODUCT_KNOWLEDGE
-#                 ]
-#                 print(f"🔁 Follow-up detected — reusing {len(products_to_show)} products from last turn")
-
-#             else:
-#                 # Fresh search — detect explicit product name mentions first
-#                 explicit_match_ids = [
-#                     pid for pid, product in kb_index.PRODUCT_KNOWLEDGE.items()
-#                     if product['title'].lower() in query
-#                 ]
-
-#                 for pid in explicit_match_ids:
-#                     product = kb_index.PRODUCT_KNOWLEDGE.get(pid)
-#                     if product:
-#                         products_to_show.append((pid, product))
-
-#                 # Semantic search for the rest
-#                 exclude_ids = self.all_shown_product_ids if user_wants_different else set()
-#                 exclude_ids |= {pid for pid, _ in products_to_show}
-
-#                 semantic_results = find_matching_products_semantic(
-#                     query,
-#                     top_k=len(kb_index.PRODUCT_KNOWLEDGE),
-#                     include_out_of_stock=out_of_stock_ok
-#                 )
-
-#                 for pid, product in semantic_results:
-#                     if pid not in exclude_ids:
-#                         products_to_show.append((pid, product))
-#                     if len(products_to_show) >= MAX_PRODUCTS:
-#                         break
-
-#             # Track shown products
-#             self.shown_this_turn = {pid for pid, _ in products_to_show}
-#             self.all_shown_product_ids.update(self.shown_this_turn)
-#             self.last_discussed_products = list(self.shown_this_turn)
-
-#             # Warn if user requested more than MAX_PRODUCTS
-#             if requested_count > MAX_PRODUCTS:
-#                 dynamic_context += (
-#                     f"\n\nNote: The user requested {requested_count} products "
-#                     f"but you can show a maximum of {MAX_PRODUCTS} at a time. "
-#                     f"Politely explain this and offer to show more on request."
-#                 )
-
-#             dynamic_context += build_product_context(products_to_show)
-#             tools.append(show_product_card)
-
-#             print(f"🛍️ Shopping | follow-up={is_followup} | products: {[pid for pid, _ in products_to_show]}")
-
-#         # -----------------------------
-#         # 4. Build and run agent
-#         # -----------------------------
-#         agent_prompt = UNIFIED_AGENT_TEMPLATE.format(
-#             context=dynamic_context or "No specific product context available.",
-#             question=last_message
-#         )
-
-#         agent = Agent(
-#             model=MODEL,
-#             name="Inspitalfields Shopping Assistant",
-#             instructions=agent_prompt,
-#             tools=tools
-#         )
-
-#         result = Runner.run_streamed(agent, agent_input, context=agent_context)
-#         async for event in stream_agent_response(agent_context, result):
-#             yield event
-
-
 """
-Orc's Nest ChatKit server — improved shopping assistant
+Choosing Keeping ChatKit server — tool-based product retrieval
 """
 
-import json
 import os
 import re
 import numpy as np
 from dotenv import load_dotenv
-from agents import Runner, Agent
+from agents import Runner, Agent, function_tool, RunContextWrapper
 from chatkit.agents import AgentContext, simple_to_agent_input, stream_agent_response
 from chatkit.server import ChatKitServer
 import openai
@@ -426,158 +54,307 @@ def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
 
 
 # --------------------------------------------------
-# Intent classifier — improved with clearer rules
+# Deterministic intent classification — no LLM call needed
 # --------------------------------------------------
-multi_intent_classifier = Agent(
-    model=MODEL,
-    name="Intent Classifier",
-    instructions="""
-You are an intent classifier for a shopping assistant chatbot.
+def classify_intent(message: str, is_shopping_already: bool) -> dict:
+    msg = message.lower().strip()
 
-Analyse the FULL conversation history and the latest message, then return ONLY valid JSON — no commentary, no markdown.
+    # Short messages are almost always followups
+    is_followup = (
+        len(message.split()) <= 4 or
+        any(msg.startswith(p) for p in [
+            "yes", "yeah", "sure", "ok", "that one", "tell me more",
+            "how many", "in stock", "can i", "and that", "what about",
+            "show me", "yes please", "sounds good", "perfect", "nice"
+        ])
+    )
 
-{
-  "shopping_active": true | false,
-  "needs_support": true | false,
-  "needs_general": true | false,
-  "is_followup": true | false,
-  "out_of_stock_ok": true | false
-}
+    # Once shopping is active keep it active unless clearly off-topic
+    non_shopping = [
+        "return", "refund", "email", "contact", "address",
+        "location", "where are you", "opening", "hours", "closed",
+        "policy", "shipping", "delivery", "how do i"
+    ]
+    is_clearly_support = any(phrase in msg for phrase in non_shopping)
 
-Rules:
-- shopping_active = true when the user is browsing, asking about products, requesting recommendations, asking about price, stock, availability, or wanting to buy something. Once true, keep it true unless the user explicitly changes topic entirely.
-- needs_support = true when asking about returns, refunds, delivery, shipping, complaints, or policies.
-- needs_general = true when asking about the company, founders, values, sustainability, or what the shop does.
-- is_followup = true when the latest message refers to a product already discussed (e.g. "how many left", "tell me more", "can I buy it", "yes please", "what about the price").
-- out_of_stock_ok = true when the user explicitly says they want to see all products regardless of stock, or asks about out-of-stock items specifically.
+    shopping_active = is_shopping_already or (not is_clearly_support)
 
-Be generous — if in doubt, set shopping_active to true.
-"""
-)
+    out_of_stock_ok = "out of stock" in msg or "unavailable" in msg or "don't have" in msg
+
+    return {
+        "shopping_active": shopping_active,
+        "is_followup": is_followup,
+        "out_of_stock_ok": out_of_stock_ok,
+    }
 
 
 # --------------------------------------------------
-# Semantic retrieval
+# Knowledge retrieval — single unified search
 # --------------------------------------------------
-def retrieve_relevant_kb(query: str, kb_entries, top_k=5, min_similarity=0.0):
-    if not kb_entries:
+def retrieve_relevant_kb(query: str, top_k: int = 8, min_similarity: float = 0.25) -> list[str]:
+    """Search all knowledge entries — general and support combined."""
+    all_knowledge = kb_index.KNOWLEDGE_INDEX
+    if not all_knowledge:
         return []
-    query_vec = embed_text(query)
-    similarities = [cosine_similarity(query_vec, entry["embedding"]) for entry in kb_entries]
-    top_indices = np.argsort(similarities)[::-1][:top_k]
-    return [kb_entries[i]["text"] for i in top_indices if similarities[i] >= min_similarity]
-
-
-def find_matching_products_semantic(query: str, top_k=MAX_PRODUCTS, include_out_of_stock=False):
-    if not query or not query.strip():
-        query = "product"
 
     query_vec = embed_text(query)
-    similarities = []
+    scored = []
+    for entry in all_knowledge:
+        sim = cosine_similarity(query_vec, entry["embedding"])
+        if sim >= min_similarity:
+            scored.append((sim, entry["text"]))
 
-    for product_id, product in kb_index.PRODUCT_KNOWLEDGE.items():
-        # Skip out of stock unless explicitly requested
-        if not include_out_of_stock and product.get("quantity", 1) == 0:
+    scored.sort(reverse=True, key=lambda x: x[0])
+    return [text for _, text in scored[:top_k]]
+
+
+# --------------------------------------------------
+# Product search — hybrid keyword + semantic
+# --------------------------------------------------
+def search_products(query: str, include_out_of_stock: bool = False, limit: int = 5) -> list[dict]:
+    """
+    Hybrid search: exact SKU/title match first, then semantic.
+    Returns list of product dicts.
+    """
+    query_lower = query.lower().strip()
+    results = []
+    seen_ids = set()
+
+    # 1. Exact SKU match
+    if query_lower in kb_index.PRODUCT_KNOWLEDGE:
+        p = kb_index.PRODUCT_KNOWLEDGE[query_lower]
+        results.append(p)
+        seen_ids.add(query_lower)
+
+    # 2. Exact or partial title match
+    for pid, product in kb_index.PRODUCT_KNOWLEDGE.items():
+        if pid in seen_ids:
             continue
-        sim = cosine_similarity(query_vec, product["embedding"])
-        similarities.append((sim, product_id, product))
+        title_lower = product["title"].lower()
+        if query_lower in title_lower or title_lower in query_lower:
+            if include_out_of_stock or product.get("quantity", 1) > 0:
+                results.append(product)
+                seen_ids.add(pid)
 
-    similarities.sort(reverse=True, key=lambda x: x[0])
-    return [(pid, p) for sim, pid, p in similarities[:top_k]]
+    # 3. Label/category match
+    query_words = set(query_lower.split())
+    for pid, product in kb_index.PRODUCT_KNOWLEDGE.items():
+        if pid in seen_ids:
+            continue
+        product_labels = {l.lower() for l in product.get("labels", [])}
+        if query_words & product_labels:  # intersection
+            if include_out_of_stock or product.get("quantity", 1) > 0:
+                results.append(product)
+                seen_ids.add(pid)
+
+    # 4. Semantic search for the rest
+    if len(results) < limit:
+        query_vec = embed_text(query)
+        scored = []
+        for pid, product in kb_index.PRODUCT_KNOWLEDGE.items():
+            if pid in seen_ids:
+                continue
+            if not include_out_of_stock and product.get("quantity", 1) == 0:
+                continue
+            sim = cosine_similarity(query_vec, product["embedding"])
+            scored.append((sim, pid, product))
+
+        scored.sort(reverse=True, key=lambda x: x[0])
+        for sim, pid, product in scored:
+            if sim < 0.3:
+                break
+            results.append(product)
+            seen_ids.add(pid)
+            if len(results) >= limit * 3:  # fetch generous pool
+                break
+
+    return results
 
 
-def build_reference_context(blocks, title):
-    if not blocks:
-        return ""
-    return f"\n\n=== {title} ===\n" + "\n\n---\n\n".join(blocks)
+def format_product_for_agent(p: dict) -> dict:
+    """Return clean product dict for agent consumption."""
+    quantity = p.get("quantity", 0)
+    if quantity == 0:
+        stock = "OUT OF STOCK"
+    elif quantity <= 3:
+        stock = f"VERY LOW — only {quantity} left"
+    elif quantity <= 10:
+        stock = f"LOW — {quantity} remaining"
+    else:
+        stock = f"In stock ({quantity} available)"
 
-
-def build_product_context(products):
-    if not products:
-        return "\n\nAvailable Products:\n[No matching products found in our current catalogue.]"
-
-    context = "\n\nAvailable Products (use this data to answer all product questions):\n"
-    for product_id, p in products:
-        quantity = p.get("quantity", 0)
-        if quantity == 0:
-            stock_status = "❌ OUT OF STOCK — do not recommend for immediate purchase"
-        elif quantity <= 3:
-            stock_status = f"🔴 VERY LOW STOCK — only {quantity} left, create urgency"
-        elif quantity <= 10:
-            stock_status = f"🟡 LOW STOCK — {quantity} remaining"
-        else:
-            stock_status = f"✅ In stock — {quantity} available"
-
-        context += (
-            f"\n- product_id: {product_id}\n"
-            f"  title: {p['title']}\n"
-            f"  price: £{p['price']} {p.get('currency', 'GBP')}\n"
-            f"  stock: {stock_status}\n"
-            f"  description: {p['description']}\n"
-            f"  labels: {', '.join(p.get('labels', []))}\n"
-            f"  image: {p.get('image_url', '')}\n"
-            f"  link: {p.get('product_url', '')}\n"
-            "  ---"
-        )
-    return context
+    return {
+        "product_id": p.get("product_id", ""),
+        "title": p.get("title", ""),
+        "price": f"£{p.get('price', 0)} {p.get('currency', 'GBP')}",
+        "stock": stock,
+        "description": p.get("description", ""),
+        "labels": p.get("labels", []),
+    }
 
 
 # --------------------------------------------------
-# Extract requested product count
+# Agent tools
 # --------------------------------------------------
-def extract_requested_count(text: str) -> int | None:
-    if not text:
-        return None
-    match = re.search(r"\b(\d+)\b", text)
-    if match:
-        try:
-            return int(match.group(1))
-        except ValueError:
-            return None
-    return None
+@function_tool(
+    description_override=(
+        "Search the product catalogue by name, category, SKU, or description. "
+        "Use this whenever a customer asks about products, wants recommendations, "
+        "asks what you stock, or mentions any product category. "
+        "Examples: 'pens', 'something under £20', 'TEN001'."
+    )
+)
+async def search_products_tool(
+    ctx: RunContextWrapper[AgentContext],
+    query: str,
+) -> dict:
+    """Search products and return results."""
+    print(f"🔍 search_products_tool called: '{query}'")
+
+    # Get thread state for out_of_stock preference
+    server = ctx.context.request_context.get("server")
+    thread_id = ctx.context.thread.id if ctx.context.thread else "anonymous"
+    out_of_stock_ok = False
+    if server:
+        state = server._get_state(thread_id)
+        out_of_stock_ok = state.get("out_of_stock_ok", False)
+
+    results = search_products(query, include_out_of_stock=out_of_stock_ok, limit=MAX_PRODUCTS)
+
+    if not results:
+        return {
+            "found": False,
+            "message": f"No products found for '{query}'. Try a different search term or ask for something similar.",
+            "products": []
+        }
+
+    formatted = [format_product_for_agent(p) for p in results[:MAX_PRODUCTS]]
+
+    # Update thread state with shown products
+    if server:
+        state = server._get_state(thread_id)
+        shown = [p.get("product_id") for p in results[:MAX_PRODUCTS]]
+        state["last_discussed_products"] = shown
+        state["all_shown_product_ids"].update(shown)
+        state["is_shopping"] = True
+
+    return {
+        "found": True,
+        "count": len(formatted),
+        "products": formatted,
+        "instruction": "Call show_product_card for each product you mention by name."
+    }
+
+
+@function_tool(
+    description_override=(
+        "Get full details for a specific product by its exact product ID or SKU. "
+        "Use this when a customer asks about a specific product you already know the ID of, "
+        "or when they mention a product name you need to confirm exists. "
+        "Example product IDs: 'TEN001', 'FOD001', 'MUG003'."
+    )
+)
+async def get_product_by_id(
+    ctx: RunContextWrapper[AgentContext],
+    product_id: str,
+) -> dict:
+    """Get a specific product by ID."""
+    print(f"🔍 get_product_by_id called: '{product_id}'")
+
+    # Try exact match first
+    product = kb_index.PRODUCT_KNOWLEDGE.get(product_id)
+
+    # Try case-insensitive
+    if not product:
+        for pid, p in kb_index.PRODUCT_KNOWLEDGE.items():
+            if pid.lower() == product_id.lower():
+                product = p
+                break
+
+    if not product:
+        return {
+            "found": False,
+            "message": f"No product found with ID '{product_id}'. The ID may be incorrect."
+        }
+
+    return {
+        "found": True,
+        "product": format_product_for_agent(product)
+    }
+
+
+@function_tool(
+    description_override=(
+        "Search for products that are similar to or go well with a given product. "
+        "Use when a customer asks for accessories, add-ons, or 'what goes with this'. "
+        "Pass the product title or category as the query."
+    )
+)
+async def find_similar_products(
+    ctx: RunContextWrapper[AgentContext],
+    query: str,
+    exclude_product_id: str = "",
+) -> dict:
+    """Find products similar to a given product."""
+    print(f"🔍 find_similar_products called: '{query}' excluding '{exclude_product_id}'")
+
+    results = search_products(query, limit=MAX_PRODUCTS + 1)
+
+    # Exclude the source product
+    results = [p for p in results if p.get("product_id") != exclude_product_id][:MAX_PRODUCTS]
+
+    if not results:
+        return {"found": False, "products": []}
+
+    return {
+        "found": True,
+        "products": [format_product_for_agent(p) for p in results]
+    }
 
 
 # --------------------------------------------------
-# Agent prompt template — improved
+# Agent prompt — behaviour only, no product data in prompt
 # --------------------------------------------------
-UNIFIED_AGENT_TEMPLATE = """
-You are Orc — the in-store assistant for the Orc's Nest in London, an independent board games shop.
+AGENT_INSTRUCTIONS = """
+You are Anna — the in-store assistant for Choosing Keeping in London.
 
 YOUR PERSONALITY:
-- You sound like a veteran game shop employee with dry humour and strong knowledge of the hobby
-- Your personality comes through mostly in introductions, transitions, and occasional side comments — never constant roleplay
-- You are enthusiastic about great games but honest about weak ones
-- You have genuine opinions and help customers find the right fit for their group
-- Your humour is subtle, understated, and occasional — one dry comment is enough
-- You speak naturally and concisely, never like a corporate FAQ page
-- You can use light fantasy/shopkeeper flavour tied to the name "Orc", but keep it grounded and readable
-- You never overwhelm the customer with lore, jokes, or long explanations
+- Thoughtful, design-savvy stationery specialist with a calm London boutique feel
+- Deep knowledge of paper goods, pens, notebooks, inks, and desk objects
+- Warm, observant, quietly witty — never loud or salesy
+- Honest about practicality, durability, and writing experience
+- Concise and natural — like a real conversation across the counter
+- Subtle literary/shopkeeper charm with understated British humour
 
-EXAMPLES OF YOUR TONE:
-- "Orc here. Good choice asking before buying that one."
-- "Dangerous game. People buy one expansion and suddenly it's a lifestyle."
-- "Only 2 left. The weekend crowd tends to loot the shelves."
-- "Brilliant if your group enjoys negotiation. Miserable if they don't."
-- "Surprisingly clever for a game about birds."
+TONE EXAMPLES:
+- "Beautiful paper stock on this one. Fountain pens behave very well with it."
+- "Dangerous little item. People come in for one notebook and leave reorganising their lives."
+- "Excellent choice if you actually write every day, not just admire stationery online."
+- "The binding’s solid. It survives being carried around London far better than most."
+- "Lovely gift. Sensible too, which is rarer."
+- "This pen has opinions about cheap paper."
 
-CRITICAL RULES — follow these exactly:
-1. Run show_product_card for products when relevant 
-2. ONLY tell the customer the stock level when you think its necessary
-3. Keep responses concise and conversational — avoid walls of text and bullet-point essays
-4. Personality should enhance the shopping experience, not dominate it
-5. Never insert the functions or tools you are calling to the chat remember you are speaking to a human so they need a normal human conversation
-6. Dont lie
+TOOLS YOU HAVE:
+- search_products_tool: search the catalogue by any query — use this whenever the customer asks about products
+- get_product_by_id: look up a specific product by its ID
+- find_similar_products: find accessories or related products
+- show_product_card: display a product card to the customer — ALWAYS call this for every product you mention
 
+HOW TO USE YOUR TOOLS:
+1. When a customer asks about ANY product or category → call search_products_tool first
+2. Never say "I don't have that in stock" without calling search_products_tool first
+3. If a customer names a specific product → call get_product_by_id to confirm it exists
+4. Never insert show_product_card firt in the response, it always has to come after some text response otherwise the user wont understand.
+5. After finding products → always call show_product_card for each one you mention
+6. If search returns nothing → say you couldn't find it and ask for more details (SKU, spelling, etc)
 
+STORE KNOWLEDGE:
+{knowledge_context}
 
+CONVERSATION CONTEXT:
+{conversation_context}
 
-PRODUCT DATA (use this as your single source of truth):
-{context}
-
-CUSTOMER MESSAGE:
-{question}
-
-Respond naturally and helpfully as Orc:
+Respond naturally as Anna. Use your tools proactively — don't guess what's in stock.
 """
 
 
@@ -588,12 +365,25 @@ class StarterChatServer(ChatKitServer):
     def __init__(self):
         self.store = MemoryStore()
         super().__init__(self.store)
+        self._thread_state = {}
 
-        # Per-session shopping state
-        self.is_shopping = False
-        self.all_shown_product_ids = set()
-        self.shown_this_turn = set()
-        self.last_discussed_products = []  # Track last products for follow-ups
+    def _get_state(self, thread_id: str) -> dict:
+        if thread_id not in self._thread_state:
+            self._thread_state[thread_id] = {
+                "is_shopping": False,
+                "all_shown_product_ids": set(),
+                "shown_this_turn": set(),
+                "last_discussed_products": [],
+                "out_of_stock_ok": False,
+                "last_query": "",
+            }
+        return self._thread_state[thread_id]
+
+    def _cleanup_old_threads(self, max_threads: int = 500):
+        if len(self._thread_state) > max_threads:
+            oldest = list(self._thread_state.keys())[:-max_threads]
+            for tid in oldest:
+                del self._thread_state[tid]
 
     async def respond(self, thread, item, context):
         # Load recent conversation
@@ -614,6 +404,15 @@ class StarterChatServer(ChatKitServer):
 
         agent_context = AgentContext(thread=thread, store=self.store, request_context=context)
 
+        # Thread-scoped state
+        thread_id = thread.id if thread else "anonymous"
+        state = self._get_state(thread_id)
+        self._cleanup_old_threads()
+
+        # Pass server reference into request context so tools can update state
+        if hasattr(agent_context, 'request_context') and isinstance(agent_context.request_context, dict):
+            agent_context.request_context["server"] = self
+
         # Get last message
         last_message = ""
         if agent_input:
@@ -624,130 +423,56 @@ class StarterChatServer(ChatKitServer):
                 last_message = str(last_msg_obj)
 
         # -----------------------------
-        # 1. Intent Classification
+        # 1. Fast deterministic intent classification
         # -----------------------------
-        intent_result = await Runner.run(
-            multi_intent_classifier,
-            agent_input,
-            context=agent_context
-        )
-
-        try:
-            intent_flags = json.loads(intent_result.final_output.strip())
-        except Exception as e:
-            print("⚠️ Intent parse failed:", intent_result.final_output, e)
-            intent_flags = {
-                "shopping_active": True,
-                "needs_support": False,
-                "needs_general": False,
-                "is_followup": False,
-                "out_of_stock_ok": False,
-            }
-
-        shopping_active = bool(intent_flags.get("shopping_active", False))
-        is_followup = bool(intent_flags.get("is_followup", False))
-        out_of_stock_ok = bool(intent_flags.get("out_of_stock_ok", False))
-
-        if shopping_active:
-            self.is_shopping = True
-        elif intent_flags.get("shopping_active") is False:
-            self.is_shopping = False
+        intent = classify_intent(last_message, state["is_shopping"])
+        state["is_shopping"] = intent["shopping_active"]
+        state["out_of_stock_ok"] = intent["out_of_stock_ok"]
 
         # -----------------------------
-        # 2. Build Dynamic Context
+        # 2. Knowledge retrieval — always runs, unified search
         # -----------------------------
-        dynamic_context = ""
-        tools = []
-
-        if intent_flags.get("needs_support"):
-            support_blocks = retrieve_relevant_kb(last_message, kb_index.SUPPORT_KNOWLEDGE)
-            dynamic_context += build_reference_context(support_blocks, "CUSTOMER SUPPORT INFORMATION")
-
-        if intent_flags.get("needs_general"):
-            general_blocks = retrieve_relevant_kb(last_message, kb_index.GENERAL_KNOWLEDGE)
-            dynamic_context += build_reference_context(general_blocks, "GENERAL KNOWLEDGE")
+        knowledge_blocks = retrieve_relevant_kb(last_message, top_k=8, min_similarity=0.25)
+        knowledge_context = "\n\n---\n\n".join(knowledge_blocks) if knowledge_blocks else "No specific store information found for this query."
 
         # -----------------------------
-        # 3. Shopping Flow
+        # 3. Conversation context summary
         # -----------------------------
-        if self.is_shopping:
-            requested_count = extract_requested_count(last_message) or MAX_PRODUCTS
-            query = last_message.lower()
+        conversation_context = ""
+        if state["last_discussed_products"]:
+            conversation_context = f"Products discussed so far: {', '.join(state['last_discussed_products'])}."
+        if state["last_query"]:
+            conversation_context += f" Last search: '{state['last_query']}'."
+        if not conversation_context:
+            conversation_context = "This is the start of the conversation."
 
-            user_wants_different = bool(re.search(r"\b(different|other|another|else|more options)\b", query))
-
-            products_to_show = []
-
-            if is_followup and self.last_discussed_products:
-                # Follow-up message — re-use the products from last turn
-                products_to_show = [
-                    (pid, kb_index.PRODUCT_KNOWLEDGE[pid])
-                    for pid in self.last_discussed_products
-                    if pid in kb_index.PRODUCT_KNOWLEDGE
-                ]
-                print(f"🔁 Follow-up detected — reusing {len(products_to_show)} products from last turn")
-
-            else:
-                # Fresh search — detect explicit product name mentions first
-                explicit_match_ids = [
-                    pid for pid, product in kb_index.PRODUCT_KNOWLEDGE.items()
-                    if product['title'].lower() in query
-                ]
-
-                for pid in explicit_match_ids:
-                    product = kb_index.PRODUCT_KNOWLEDGE.get(pid)
-                    if product:
-                        products_to_show.append((pid, product))
-
-                # Semantic search for the rest
-                exclude_ids = self.all_shown_product_ids if user_wants_different else set()
-                exclude_ids |= {pid for pid, _ in products_to_show}
-
-                semantic_results = find_matching_products_semantic(
-                    query,
-                    top_k=len(kb_index.PRODUCT_KNOWLEDGE),
-                    include_out_of_stock=out_of_stock_ok
-                )
-
-                for pid, product in semantic_results:
-                    if pid not in exclude_ids:
-                        products_to_show.append((pid, product))
-                    if len(products_to_show) >= MAX_PRODUCTS:
-                        break
-
-            # Track shown products
-            self.shown_this_turn = {pid for pid, _ in products_to_show}
-            self.all_shown_product_ids.update(self.shown_this_turn)
-            self.last_discussed_products = list(self.shown_this_turn)
-
-            # Warn if user requested more than MAX_PRODUCTS
-            if requested_count > MAX_PRODUCTS:
-                dynamic_context += (
-                    f"\n\nNote: The user requested {requested_count} products "
-                    f"but you can show a maximum of {MAX_PRODUCTS} at a time. "
-                    f"Politely explain this and offer to show more on request."
-                )
-
-            dynamic_context += build_product_context(products_to_show)
-            tools.append(show_product_card)
-
-            print(f"🛍️ Shopping | follow-up={is_followup} | products: {[pid for pid, _ in products_to_show]}")
+        # Update last query
+        if not intent["is_followup"] and len(last_message.split()) > 2:
+            state["last_query"] = last_message
 
         # -----------------------------
-        # 4. Build and run agent
+        # 4. Build agent with tools
         # -----------------------------
-        agent_prompt = UNIFIED_AGENT_TEMPLATE.format(
-            context=dynamic_context or "No specific product context available.",
-            question=last_message
-        )
-
         agent = Agent(
             model=MODEL,
-            name="Orcs Nest Shopping Assistant",
-            instructions=agent_prompt,
-            tools=tools
+            name="Choosing Keeping Shopping Assistant",
+            instructions=AGENT_INSTRUCTIONS.format(
+                knowledge_context=knowledge_context,
+                conversation_context=conversation_context,
+            ),
+            tools=[
+                search_products_tool,
+                get_product_by_id,
+                find_similar_products,
+                show_product_card,
+            ]
         )
 
+        print(f"🏪 Anna | thread={thread_id} | shopping={state['is_shopping']} | followup={intent['is_followup']}")
+
+        # -----------------------------
+        # 5. Stream response
+        # -----------------------------
         result = Runner.run_streamed(agent, agent_input, context=agent_context)
         async for event in stream_agent_response(agent_context, result):
             yield event
